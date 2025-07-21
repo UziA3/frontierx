@@ -159,10 +159,9 @@ let recordings = [];
 
 let pttCompensation = Number(pttRange.value); // ms
 
-// For ECG simulation
+// ECG simulation params
 const ecgPeriod = 1000; // ms (60 bpm)
 let simulationTime = 0;
-let lastSimulatedRTime = -Infinity;
 
 let animationFrameId = null;
 
@@ -170,7 +169,7 @@ let animationFrameId = null;
 let bluetoothDevice = null;
 let bluetoothCharacteristic = null;
 
-// Utility: format ms to mm:ss.ss
+// Utils
 function formatTime(ms) {
   const totalSeconds = ms / 1000;
   const minutes = Math.floor(totalSeconds / 60);
@@ -178,7 +177,137 @@ function formatTime(ms) {
   return `${minutes.toString().padStart(2,'0')}:${seconds.toFixed(2).padStart(5,'0')}`;
 }
 
-// Start recording session
+function clearCanvas() {
+  ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+}
+
+function enableButtonsDuringRecording(isRecording, isPaused = false) {
+  startBtn.disabled = isRecording;
+  pauseBtn.disabled = !isRecording || isPaused;
+  resumeBtn.disabled = !isRecording || !isPaused;
+  stopBtn.disabled = !isRecording;
+  markThrobBtn.disabled = !isRecording || isPaused;
+  exportCSVButtonsEnabled(recordings.length > 0);
+}
+
+function exportCSVButtonsEnabled(enabled) {
+  const buttons = recordingsUl.querySelectorAll('button.export-csv');
+  buttons.forEach(btn => btn.disabled = !enabled);
+}
+
+function findPriorPeakIndex(time) {
+  for(let i = pulsePeaks.length - 1; i >= 0; i--) {
+    if(pulsePeaks[i].time <= time) return i;
+  }
+  return -1;
+}
+
+// ECG simulation - Gaussian PQRST
+function simulateECGSample(t) {
+  function gauss(x, mean, sd, amplitude) {
+    return amplitude * Math.exp(-((x - mean) ** 2) / (2 * sd * sd));
+  }
+  const cycleTime = t % ecgPeriod;
+  const p = gauss(cycleTime, 100, 15, 0.1);
+  const q = gauss(cycleTime, 200, 7, -0.15);
+  const r = gauss(cycleTime, 250, 5, 1.0);
+  const s = gauss(cycleTime, 280, 5, -0.25);
+  const tWave = gauss(cycleTime, 400, 30, 0.35);
+  return p + q + r + s + tWave;
+}
+
+function updateTimer() {
+  if(!recording || paused) return;
+  const now = performance.now();
+  const elapsed = now - startTime - elapsedPauseTime;
+  updateTimerDisplay(elapsed);
+}
+
+function updateTimerDisplay(ms) {
+  timerDisplay.textContent = formatTime(ms);
+}
+
+// Drawing function
+function drawCanvas() {
+  if(!waveformVisible) {
+    clearCanvas();
+    return;
+  }
+
+  ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+
+  // Draw waveform line
+  ctx.beginPath();
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  for(let i = 0; i < waveformData.length; i++) {
+    const x = (i / dataBufferSize) * canvasWidth;
+    const norm = (waveformData[i] + 0.5) / 1.7; // normalize approx -0.5 to 1.2 range
+    const y = canvasHeight - norm * canvasHeight;
+    if(i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Draw pulse peaks (red)
+  ctx.fillStyle = 'red';
+  pulsePeaks.forEach(p => {
+    const relTime = simulationTime - p.time;
+    if(relTime < 0 || relTime > displaySeconds * 1000) return;
+    const x = canvasWidth * (1 - relTime / (displaySeconds * 1000));
+    const bufferIndex = Math.floor(dataBufferSize - 1 - (relTime / 1000 * sampleRate));
+    if(bufferIndex < 0 || bufferIndex >= waveformData.length) return;
+    const sampleVal = waveformData[bufferIndex];
+    const norm = (sampleVal + 0.5) / 1.7;
+    const y = canvasHeight - norm * canvasHeight;
+    ctx.beginPath();
+    ctx.arc(x, y, 6, 0, 2 * Math.PI);
+    ctx.fill();
+  });
+
+  // Draw throbs (green) above waveform
+  ctx.fillStyle = 'green';
+  throbs.forEach(t => {
+    const relTime = simulationTime - t.time;
+    if(relTime < 0 || relTime > displaySeconds * 1000) return;
+    const x = canvasWidth * (1 - relTime / (displaySeconds * 1000));
+    const y = canvasHeight * 0.15;
+    ctx.beginPath();
+    ctx.arc(x, y, 6, 0, 2 * Math.PI);
+    ctx.fill();
+  });
+}
+
+// Simulation and recording loop
+function runSimulation() {
+  if(!recording || paused) return;
+
+  const now = performance.now();
+  const elapsed = now - startTime - elapsedPauseTime;
+  simulationTime = elapsed;
+
+  // Generate waveform sample
+  const sample = simulateECGSample(simulationTime);
+
+  waveformData.shift();
+  waveformData.push(sample);
+
+  timeBuffer.shift();
+  timeBuffer.push(simulationTime);
+
+  // Add pulse peak at each new ECG cycle's R peak (at 250 ms offset)
+  const currentCycle = Math.floor(simulationTime / ecgPeriod);
+  const lastPeakCycle = pulsePeaks.length > 0 ? Math.floor(pulsePeaks[pulsePeaks.length - 1].time / ecgPeriod) : -1;
+  if(currentCycle > lastPeakCycle) {
+    pulsePeaks.push({ time: currentCycle * ecgPeriod + 250 });
+  }
+
+  drawCanvas();
+
+  animationFrameId = requestAnimationFrame(runSimulation);
+}
+
+// Start recording
 function startRecording() {
   if(recording) return;
   recording = true;
@@ -186,7 +315,6 @@ function startRecording() {
   startTime = performance.now();
   elapsedPauseTime = 0;
   simulationTime = 0;
-  lastSimulatedRTime = -Infinity;
   pulsePeaks = [];
   throbs = [];
   waveformData.fill(0);
@@ -219,7 +347,7 @@ function resumeRecording() {
   timerInterval = setInterval(updateTimer, 20);
 }
 
-// Stop recording and save
+// Stop and save recording
 function stopRecording() {
   if(!recording) return;
   recording = false;
@@ -232,7 +360,6 @@ function stopRecording() {
     recordingName = `Recording_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}`;
   }
 
-  // Link each throb to its prior peak index
   throbs.forEach(t => {
     t.priorPeakIndex = findPriorPeakIndex(t.time);
   });
@@ -244,189 +371,38 @@ function stopRecording() {
     pttCompensation,
     durationMs: performance.now() - startTime - elapsedPauseTime
   };
+
   recordings.push(recordingData);
   addRecordingToList(recordingData);
+
   enableButtonsDuringRecording(false);
   clearCanvas();
   updateTimerDisplay(0);
-
-  // Reset buffers
   pulsePeaks = [];
   throbs = [];
 }
 
-// Mark a migraine throb
+// Mark migraine throb
 function markThrob() {
   if(!recording || paused) return;
   const now = performance.now() - startTime - elapsedPauseTime;
-  throbs.push({time: now, priorPeakIndex: findPriorPeakIndex(now)});
+  throbs.push({ time: now, priorPeakIndex: findPriorPeakIndex(now) });
 }
 
-// Find the index of pulse peak immediately before given time
-function findPriorPeakIndex(time) {
-  for(let i = pulsePeaks.length - 1; i >= 0; i--) {
-    if(pulsePeaks[i].time <= time) return i;
-  }
-  return -1;
-}
-
-// Timer update
-function updateTimer() {
-  if(!recording || paused) return;
-  const now = performance.now();
-  const elapsed = now - startTime - elapsedPauseTime;
-  updateTimerDisplay(elapsed);
-}
-
-// Update timer display text
-function updateTimerDisplay(ms) {
-  timerDisplay.textContent = formatTime(ms);
-}
-
-// Enable/disable buttons based on recording state
-function enableButtonsDuringRecording(isRecording, isPaused = false) {
-  startBtn.disabled = isRecording;
-  pauseBtn.disabled = !isRecording || isPaused;
-  resumeBtn.disabled = !isRecording || !isPaused;
-  stopBtn.disabled = !isRecording;
-  markThrobBtn.disabled = !isRecording || isPaused;
-  exportCSVButtonsEnabled(recordings.length > 0);
-}
-
-// Enable/disable all export buttons in recordings list
-function exportCSVButtonsEnabled(enabled) {
-  const buttons = recordingsUl.querySelectorAll('button.export-csv');
-  buttons.forEach(btn => btn.disabled = !enabled);
-}
-
-// ECG simulation function: Gaussian pulses for PQRST
-function simulateECGSample(t) {
-  // t in ms mod ecgPeriod
-
-  function gauss(x, mean, sd, amplitude) {
-    return amplitude * Math.exp(-((x - mean) ** 2) / (2 * sd * sd));
-  }
-
-  const cycleTime = t % ecgPeriod;
-
-  const p = gauss(cycleTime, 100, 15, 0.1);
-  const q = gauss(cycleTime, 200, 7, -0.15);
-  const r = gauss(cycleTime, 250, 5, 1.0);
-  const s = gauss(cycleTime, 280, 5, -0.25);
-  const tWave = gauss(cycleTime, 400, 30, 0.35);
-
-  return p + q + r + s + tWave;
-}
-
-// Run simulation and draw
-function runSimulation() {
-  if(!recording || paused) return;
-
-  const now = performance.now();
-  const elapsed = now - startTime - elapsedPauseTime;
-  simulationTime = elapsed;
-
-  // Generate sample for current time
-  const sample = simulateECGSample(simulationTime);
-
-  // Shift waveform data buffer and time buffer
-  waveformData.shift();
-  waveformData.push(sample);
-  timeBuffer.shift();
-  timeBuffer.push(simulationTime);
-
-  // Detect R peak by simulation timing directly (R at 250ms in cycle)
-  // Register pulse peak exactly when simulationTime crosses 250 + n*ecgPeriod
-  const prevCycle = Math.floor((simulationTime - 1) / ecgPeriod);
-  const currCycle = Math.floor(simulationTime / ecgPeriod);
-  if(currCycle > prevCycle) {
-    // New cycle started, R peak at cycle start + 250 ms
-    const peakTime = currCycle * ecgPeriod + 250;
-    // Add peak if it hasn't been added yet (allow some leeway)
-    if(pulsePeaks.length === 0 || peakTime > pulsePeaks[pulsePeaks.length - 1].time + 200) {
-      pulsePeaks.push({time: peakTime});
-    }
-  }
-
-  drawCanvas();
-
-  animationFrameId = requestAnimationFrame(runSimulation);
-}
-
-// Draw canvas waveform and markers aligned to simulationTime
-function drawCanvas() {
-  if(!waveformVisible) {
-    clearCanvas();
-    return;
-  }
-
-  ctx.clearRect(0, 0, canvasWidth, canvasHeight);
-
-  // Draw waveform line
-  ctx.beginPath();
-  ctx.strokeStyle = '#000';
-  ctx.lineWidth = 2;
-  for(let i = 0; i < waveformData.length; i++) {
-    const x = (i / dataBufferSize) * canvasWidth;
-    const norm = (waveformData[i] + 0.5) / 1.7; // Normalize approx -0.5 to 1.2
-    const y = canvasHeight - norm * canvasHeight;
-    if(i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-
-  // Draw pulse peaks (red) on waveform
-  ctx.fillStyle = 'red';
-  pulsePeaks.forEach(p => {
-    const relTime = simulationTime - p.time;
-    if(relTime < 0 || relTime > displaySeconds * 1000) return;
-    const x = canvasWidth * (1 - relTime / (displaySeconds * 1000));
-    // Find waveform value near this time to place dot on waveform line
-    const bufferIndex = Math.floor(dataBufferSize - 1 - (relTime / 1000 * sampleRate));
-    if(bufferIndex < 0 || bufferIndex >= waveformData.length) return;
-    const sampleVal = waveformData[bufferIndex];
-    const norm = (sampleVal + 0.5) / 1.7;
-    const y = canvasHeight - norm * canvasHeight;
-    ctx.beginPath();
-    ctx.arc(x, y, 6, 0, 2 * Math.PI);
-    ctx.fill();
-  });
-
-  // Draw migraine throbs (green) above waveform line (fixed y)
-  ctx.fillStyle = 'green';
-  throbs.forEach(t => {
-    const relTime = simulationTime - t.time;
-    if(relTime < 0 || relTime > displaySeconds * 1000) return;
-    const x = canvasWidth * (1 - relTime / (displaySeconds * 1000));
-    const y = canvasHeight * 0.15;
-    ctx.beginPath();
-    ctx.arc(x, y, 6, 0, 2 * Math.PI);
-    ctx.fill();
-  });
-}
-
-// Clear canvas
-function clearCanvas() {
-  ctx.clearRect(0, 0, canvasWidth, canvasHeight);
-}
-
-// Add recording to list UI with export button
+// Add recording entry to list UI
 function addRecordingToList(rec) {
   const li = document.createElement('li');
 
-  // Name span
   const nameSpan = document.createElement('span');
   nameSpan.textContent = rec.name;
   nameSpan.className = 'name';
   li.appendChild(nameSpan);
 
-  // Info text
   const infoSpan = document.createElement('span');
   infoSpan.textContent = ` Duration: ${(rec.durationMs/1000).toFixed(1)}s, Throbs: ${rec.throbs.length}, Pulses: ${rec.pulsePeaks.length}`;
   infoSpan.style.marginLeft = '8px';
   li.appendChild(infoSpan);
 
-  // Export CSV button
   const exportBtn = document.createElement('button');
   exportBtn.textContent = 'Export CSV';
   exportBtn.className = 'recording-button export-csv';
@@ -437,17 +413,16 @@ function addRecordingToList(rec) {
   exportCSVButtonsEnabled(true);
 }
 
-// Export CSV for given recording
+// Export CSV function
 function exportCSV(rec) {
   if(!rec) return;
 
-  // Calculate phase and delta arrays for throbs
   const phases = [];
   const deltas = [];
 
   for(let i = 0; i < rec.throbs.length; i++) {
     const throb = rec.throbs[i];
-    if(throb.priorPeakIndex < 0 || throb.priorPeakIndex >= rec.pulsePeaks.length -1) continue;
+    if(throb.priorPeakIndex < 0 || throb.priorPeakIndex >= rec.pulsePeaks.length - 1) continue;
     const priorR = rec.pulsePeaks[throb.priorPeakIndex];
     const nextR = rec.pulsePeaks[throb.priorPeakIndex + 1];
     const delta = throb.time - priorR.time + rec.pttCompensation;
@@ -459,7 +434,6 @@ function exportCSV(rec) {
   }
 
   const n = phases.length;
-  // Compute Rayleigh R and mean angle
   let sumSin = 0, sumCos = 0;
   for(let p of phases) {
     sumSin += Math.sin(p);
@@ -467,7 +441,6 @@ function exportCSV(rec) {
   }
   const meanAngle = Math.atan2(sumSin/n, sumCos/n);
   const R = Math.sqrt((sumCos/n)**2 + (sumSin/n)**2);
-  // Approximate Rayleigh p-value
   const rayleighP = Math.exp(Math.sqrt(1+4*n+4*(n**2 - (n*R)**2)) - (1+2*n));
 
   const meanDelta = deltas.reduce((a,b)=>a+b,0)/n || 0;
@@ -495,92 +468,4 @@ function exportCSV(rec) {
     if(interval <= 0) continue;
     const phase = ((delta % interval) + interval) % interval / interval * 2 * Math.PI;
     const bpm = 60000 / ecgPeriod;
-    csvContent += `${throb.time.toFixed(2)},${priorR.time.toFixed(2)},${delta.toFixed(2)},${bpm.toFixed(2)},${phase.toFixed(4)}\n`;
-  }
-
-  csvContent += `\nPulse Peak Timestamps (ms)\n`;
-  for(let p of rec.pulsePeaks) {
-    csvContent += `${p.time.toFixed(2)}\n`;
-  }
-
-  // Download CSV
-  const blob = new Blob([csvContent], {type: 'text/csv;charset=utf-8;'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `${rec.name.replace(/\s+/g,'_')}_migraine_throb_sync.csv`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-// Toggle waveform display
-function toggleWaveform() {
-  waveformVisible = !waveformVisible;
-  toggleWaveformBtn.textContent = waveformVisible ? 'Hide Waveform' : 'Show Waveform';
-  if(!waveformVisible) clearCanvas();
-  else drawCanvas();
-}
-
-pttRange.addEventListener('input', e => {
-  pttCompensation = Number(e.target.value);
-  pttValueSpan.textContent = pttCompensation;
-});
-
-startBtn.addEventListener('click', startRecording);
-pauseBtn.addEventListener('click', pauseRecording);
-resumeBtn.addEventListener('click', resumeRecording);
-stopBtn.addEventListener('click', stopRecording);
-markThrobBtn.addEventListener('click', markThrob);
-toggleWaveformBtn.addEventListener('click', toggleWaveform);
-
-// Bluetooth connect (Frontier X filtered by name prefix)
-connectBluetoothBtn.addEventListener('click', async () => {
-  if(!navigator.bluetooth) {
-    alert('Web Bluetooth API not supported in this browser.');
-    return;
-  }
-  try {
-    bluetoothDevice = await navigator.bluetooth.requestDevice({
-      filters: [{namePrefix: 'Frontier'}],
-      optionalServices: ['heart_rate']
-    });
-    bluetoothDevice.addEventListener('gattserverdisconnected', () => {
-      alert('Bluetooth device disconnected');
-      bluetoothDevice = null;
-      bluetoothCharacteristic = null;
-    });
-    const server = await bluetoothDevice.gatt.connect();
-    const service = await server.getPrimaryService('heart_rate');
-    bluetoothCharacteristic = await service.getCharacteristic('heart_rate_measurement');
-    await bluetoothCharacteristic.startNotifications();
-    bluetoothCharacteristic.addEventListener('characteristicvaluechanged', handleBluetoothData);
-    alert(`Connected to ${bluetoothDevice.name}`);
-  } catch(e) {
-    alert('Bluetooth connection failed: ' + e);
-  }
-});
-
-function handleBluetoothData(event) {
-  if(!recording || paused) return;
-
-  const value = event.target.value;
-  const flags = value.getUint8(0);
-  const hrFormat = flags & 0x01;
-  let heartRate = 0;
-  if(hrFormat === 0) {
-    heartRate = value.getUint8(1);
-  } else {
-    heartRate = value.getUint16(1, true);
-  }
-
-  // For demo: mark pulse peak at current timestamp for Bluetooth data
-  const now = performance.now() - startTime - elapsedPauseTime;
-  pulsePeaks.push({time: now});
-  drawCanvas();
-}
-
-</script>
-</body>
-</html>
+    csvContent += `${throb.time.toFixed(

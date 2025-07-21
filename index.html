@@ -468,4 +468,60 @@ function exportCSV(rec) {
     if(interval <= 0) continue;
     const phase = ((delta % interval) + interval) % interval / interval * 2 * Math.PI;
     const bpm = 60000 / ecgPeriod;
-    csvContent += `${throb.time.toFixed(
+    csvContent += `${throb.time.toFixed(2)},${priorR.time.toFixed(2)},${delta.toFixed(2)},${bpm.toFixed(2)},${phase.toFixed(4)}\n`;
+  }
+
+  csvContent += `\nPulse Peak Timestamps (ms)\n`;
+  rec.pulsePeaks.forEach(p => {
+    csvContent += `${p.time.toFixed(2)}\n`;
+  });
+
+  const blob = new Blob([csvContent], {type: 'text/csv'});
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${rec.name.replace(/\s+/g,'_')}_data.csv`;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// UI Event Listeners
+startBtn.addEventListener('click', () => {
+  startRecording();
+});
+pauseBtn.addEventListener('click', () => {
+  pauseRecording();
+});
+resumeBtn.addEventListener('click', () => {
+  resumeRecording();
+});
+stopBtn.addEventListener('click', () => {
+  stopRecording();
+});
+markThrobBtn.addEventListener('click', () => {
+  markThrob();
+});
+toggleWaveformBtn.addEventListener('click', () => {
+  waveformVisible = !waveformVisible;
+  toggleWaveformBtn.textContent = waveformVisible ? 'Hide Waveform' : 'Show Waveform';
+  if(!waveformVisible) clearCanvas();
+});
+pttRange.addEventListener('input', () => {
+  pttCompensation = Number(pttRange.value);
+  pttValueSpan.textContent = pttCompensation;
+});
+connectBluetoothBtn.addEventListener('click', () => {
+  alert('Bluetooth feature not implemented in this demo.\nUse real device + HTTPS to enable Web Bluetooth.');
+});
+
+// Initialize UI state
+enableButtonsDuringRecording(false);
+
+</script>
+</body>
+</html>

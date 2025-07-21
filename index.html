@@ -11,11 +11,9 @@
     background: #fafafa;
     color: #222;
   }
-
   h1 {
     text-align: center;
   }
-
   #controls {
     margin-bottom: 15px;
     display: flex;
@@ -24,39 +22,56 @@
     justify-content: center;
     align-items: center;
   }
-
   #controls button, #controls input[type=range] {
     padding: 6px 12px;
     font-size: 14px;
   }
-
   #timer {
     font-size: 24px;
     text-align: center;
     margin-bottom: 10px;
   }
-
   #waveformCanvas {
     background: #fff;
     border: 1px solid #ccc;
     display: block;
     margin: 0 auto 20px auto;
   }
-
   #recordingsList {
     max-width: 800px;
     margin: 0 auto;
   }
-
   #recordingsList ul {
     list-style: none;
     padding: 0;
   }
-
   #recordingsList li {
     margin-bottom: 8px;
     border-bottom: 1px solid #ddd;
     padding-bottom: 4px;
+  }
+  #legend {
+    max-width: 800px;
+    margin: 0 auto 15px auto;
+    font-size: 14px;
+    text-align: center;
+  }
+  #legend span {
+    display: inline-block;
+    margin: 0 10px;
+  }
+  .dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    display: inline-block;
+    vertical-align: middle;
+  }
+  .dot.red {
+    background: red;
+  }
+  .dot.green {
+    background: green;
   }
 </style>
 </head>
@@ -80,6 +95,11 @@
 <div id="timer">00:00.00</div>
 
 <canvas id="waveformCanvas" width="800" height="200"></canvas>
+
+<div id="legend">
+  <span><span class="dot red"></span> Pulse Peak (R wave)</span>
+  <span><span class="dot green"></span> Migraine Throb</span>
+</div>
 
 <div id="recordingsList">
   <h2>Recordings</h2>
@@ -201,7 +221,13 @@ function stopRecording() {
   clearInterval(timerInterval);
 
   const recordingName = prompt('Name this recording session:', `Recording_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}`);
-  if(!recordingName) return; // Cancel save
+  if(!recordingName) {
+    // Cancel save: allow new recording anyway
+    enableButtonsDuringRecording(false);
+    clearCanvas();
+    updateTimerDisplay(0);
+    return;
+  }
 
   const recordingData = {
     name: recordingName,
@@ -216,8 +242,11 @@ function stopRecording() {
   enableButtonsDuringRecording(false);
   clearCanvas();
   updateTimerDisplay(0);
-  waveformData.fill(0);
-  timeBuffer.fill(0);
+
+  // Reset for new recording
+  pulsePeaks = [];
+  throbs = [];
+  bpmHistory = [];
 }
 
 // Mark a migraine throb
@@ -356,26 +385,32 @@ function drawCanvas() {
   }
   ctx.stroke();
 
-  // Draw pulse peaks (red)
+  // Draw pulse peaks (red) on waveform line
   ctx.fillStyle = 'red';
   pulsePeaks.forEach(p => {
-    // find position on canvas (time normalized within last 5s window)
     const relTime = simulationTime - p.time;
     if(relTime > displaySeconds * 1000 || relTime < 0) return;
     const x = canvasWidth * (1 - relTime / (displaySeconds * 1000));
-    const y = canvasHeight * 0.9;
+
+    // find y nearest waveform value at x position
+    const bufferIndex = Math.floor(relTime / 1000 * sampleRate);
+    if(bufferIndex < 0 || bufferIndex >= waveformData.length) return;
+    const sampleVal = waveformData[waveformData.length - 1 - bufferIndex];
+    const norm = (sampleVal + 0.5) / 1.7;
+    const y = canvasHeight - norm * canvasHeight;
+
     ctx.beginPath();
-    ctx.arc(x, y, 5, 0, 2 * Math.PI);
+    ctx.arc(x, y, 6, 0, 2 * Math.PI);
     ctx.fill();
   });
 
-  // Draw throbs (green)
+  // Draw throbs (green) above waveform line
   ctx.fillStyle = 'green';
   throbs.forEach(t => {
     const relTime = simulationTime - t.time;
     if(relTime > displaySeconds * 1000 || relTime < 0) return;
     const x = canvasWidth * (1 - relTime / (displaySeconds * 1000));
-    const y = canvasHeight * 0.1;
+    const y = canvasHeight * 0.15;
     ctx.beginPath();
     ctx.arc(x, y, 6, 0, 2 * Math.PI);
     ctx.fill();
@@ -491,13 +526,11 @@ function toggleWaveform() {
   drawCanvas();
 }
 
-// PTT slider change handler
 pttRange.addEventListener('input', e => {
   pttCompensation = Number(e.target.value);
   pttValueSpan.textContent = pttCompensation;
 });
 
-// Button listeners
 startBtn.addEventListener('click', startRecording);
 pauseBtn.addEventListener('click', pauseRecording);
 resumeBtn.addEventListener('click', resumeRecording);
@@ -506,7 +539,7 @@ markThrobBtn.addEventListener('click', markThrob);
 toggleWaveformBtn.addEventListener('click', toggleWaveform);
 exportCSVBtn.addEventListener('click', exportCSV);
 
-// Bluetooth connection handler
+// Bluetooth connect button (placeholder - frontierX device filtered by namePrefix)
 connectBluetoothBtn.addEventListener('click', async () => {
   if(!navigator.bluetooth) {
     alert('Web Bluetooth API not supported in this browser.');
@@ -515,7 +548,7 @@ connectBluetoothBtn.addEventListener('click', async () => {
 
   try {
     bluetoothDevice = await navigator.bluetooth.requestDevice({
-      filters: [{namePrefix: 'Frontier'}], // adjust to your device's advertised name prefix
+      filters: [{namePrefix: 'Frontier'}],
       optionalServices: ['heart_rate']
     });
 
@@ -526,43 +559,40 @@ connectBluetoothBtn.addEventListener('click', async () => {
     });
 
     const server = await bluetoothDevice.gatt.connect();
-
     const service = await server.getPrimaryService('heart_rate');
     bluetoothCharacteristic = await service.getCharacteristic('heart_rate_measurement');
-
     await bluetoothCharacteristic.startNotifications();
-
     bluetoothCharacteristic.addEventListener('characteristicvaluechanged', handleBluetoothData);
 
     alert(`Connected to ${bluetoothDevice.name}`);
-
-  } catch (error) {
-    alert('Bluetooth connection failed: ' + error);
+  } catch(e) {
+    alert('Bluetooth connection failed: ' + e);
   }
 });
 
-// Handle incoming Bluetooth data (basic placeholder)
 function handleBluetoothData(event) {
   if(!recording || paused) return;
 
   const value = event.target.value;
-  // According to BLE Heart Rate spec, HR value starts at byte 1 or 2, simplified here:
-  let heartRate = 0;
+  // Heart rate value extraction based on BLE HR spec
   const flags = value.getUint8(0);
   const hrFormat = flags & 0x01;
+  let heartRate = 0;
   if(hrFormat === 0) {
     heartRate = value.getUint8(1);
   } else {
-    heartRate = value.getUint16(1, /*littleEndian=*/true);
+    heartRate = value.getUint16(1, true);
   }
 
   const now = performance.now() - startTime - elapsedPauseTime;
 
-  // We'll simulate pulse peak arrival each time we get a HR notification
+  // Simulate pulse peak arrival at each HR notification
+  // You may want to implement more sophisticated processing here
   pulsePeaks.push({time: now});
   updateBPM(now);
   drawCanvas();
 }
+
 </script>
 </body>
 </html>

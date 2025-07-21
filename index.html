@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Migraine Throb Synchrony App</title>
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    margin: 20px;
+    background: #fafafa;
+    color: #222;
+  }
+
+  h1 {
+    text-align: center;
+  }
+
+  #controls {
+    margin-bottom: 15px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    justify-content: center;
+    align-items: center;
+  }
+
+  #controls button, #controls input[type=range] {
+    padding: 6px 12px;
+    font-size: 14px;
+  }
+
+  #timer {
+    font-size: 24px;
+    text-align: center;
+    margin-bottom: 10px;
+  }
+
+  #waveformCanvas {
+    background: #fff;
+    border: 1px solid #ccc;
+    display: block;
+    margin: 0 auto 20px auto;
+  }
+
+  #recordingsList {
+    max-width: 800px;
+    margin: 0 auto;
+  }
+
+  #recordingsList ul {
+    list-style: none;
+    padding: 0;
+  }
+
+  #recordingsList li {
+    margin-bottom: 8px;
+    border-bottom: 1px solid #ddd;
+    padding-bottom: 4px;
+  }
+</style>
+</head>
+<body>
+<h1>Migraine Throb Synchrony App</h1>
+
+<div id="controls">
+  <button id="startBtn">Start</button>
+  <button id="pauseBtn" disabled>Pause</button>
+  <button id="resumeBtn" disabled>Resume</button>
+  <button id="stopBtn" disabled>Stop & Save</button>
+  <button id="markThrobBtn" disabled>Mark Throb</button>
+  <button id="toggleWaveformBtn">Hide Waveform</button>
+  <button id="exportCSVBtn" disabled>Export CSV</button>
+  <label for="pttRange">PTT Compensation (ms): </label>
+  <input type="range" id="pttRange" min="0" max="500" value="200" step="10" />
+  <span id="pttValue">200</span> ms
+  <button id="connectBluetoothBtn">Connect Frontier X (Bluetooth)</button>
+</div>
+
+<div id="timer">00:00.00</div>
+
+<canvas id="waveformCanvas" width="800" height="200"></canvas>
+
+<div id="recordingsList">
+  <h2>Recordings</h2>
+  <ul id="recordingsUl"></ul>
+</div>
+
+<script>
+'use strict';
+
+const canvas = document.getElementById('waveformCanvas');
+const ctx = canvas.getContext('2d');
+
+const startBtn = document.getElementById('startBtn');
+const pauseBtn = document.getElementById('pauseBtn');
+const resumeBtn = document.getElementById('resumeBtn');
+const stopBtn = document.getElementById('stopBtn');
+const markThrobBtn = document.getElementById('markThrobBtn');
+const toggleWaveformBtn = document.getElementById('toggleWaveformBtn');
+const exportCSVBtn = document.getElementById('exportCSVBtn');
+const pttRange = document.getElementById('pttRange');
+const pttValueSpan = document.getElementById('pttValue');
+const timerDisplay = document.getElementById('timer');
+const recordingsUl = document.getElementById('recordingsUl');
+const connectBluetoothBtn = document.getElementById('connectBluetoothBtn');
+
+let recording = false;
+let paused = false;
+let startTime = 0;
+let elapsedPauseTime = 0;
+let pauseStart = 0;
+let timerInterval = null;
+
+let waveformVisible = true;
+
+const sampleRate = 250; // samples per second
+const displaySeconds = 5;
+const canvasWidth = canvas.width;
+const canvasHeight = canvas.height;
+
+const dataBufferSize = sampleRate * displaySeconds;
+let waveformData = new Array(dataBufferSize).fill(0);
+let timeBuffer = new Array(dataBufferSize).fill(0);
+
+let pulsePeaks = []; // { time: ms from start }
+let throbs = []; // { time: ms from start, priorPeakIndex }
+let bpmHistory = [];
+
+let recordings = [];
+
+let pttCompensation = Number(pttRange.value); // ms
+
+// For ECG simulation
+const ecgPeriod = 1000; // ms (60 bpm)
+let lastPeakTime = 0;
+let simulationTime = 0;
+
+let animationFrameId = null;
+
+// Placeholder for Bluetooth device and characteristic
+let bluetoothDevice = null;
+let bluetoothCharacteristic = null;
+
+// Utility: format ms to mm:ss.ss
+function formatTime(ms) {
+  const totalSeconds = ms / 1000;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes.toString().padStart(2,'0')}:${seconds.toFixed(2).padStart(5,'0')}`;
+}
+
+// Start recording session
+function startRecording() {
+  if(recording) return;
+  recording = true;
+  paused = false;
+  startTime = performance.now();
+  elapsedPauseTime = 0;
+  lastPeakTime = 0;
+  simulationTime = 0;
+  pulsePeaks = [];
+  throbs = [];
+  bpmHistory = [];
+  waveformData.fill(0);
+  timeBuffer.fill(0);
+  clearCanvas();
+  enableButtonsDuringRecording(true);
+  updateTimerDisplay(0);
+  runSimulation();
+  timerInterval = setInterval(updateTimer, 20);
+}
+
+// Pause recording
+function pauseRecording() {
+  if(!recording || paused) return;
+  paused = true;
+  pauseStart = performance.now();
+  enableButtonsDuringRecording(false,true);
+  cancelAnimationFrame(animationFrameId);
+  clearInterval(timerInterval);
+}
+
+// Resume recording
+function resumeRecording() {
+  if(!recording || !paused) return;
+  paused = false;
+  const pauseDuration = performance.now() - pauseStart;
+  elapsedPauseTime += pauseDuration;
+  enableButtonsDuringRecording(true);
+  runSimulation();
+  timerInterval = setInterval(updateTimer, 20);
+}
+
+// Stop recording and save
+function stopRecording() {
+  if(!recording) return;
+  recording = false;
+  paused = false;
+  cancelAnimationFrame(animationFrameId);
+  clearInterval(timerInterval);
+
+  const recordingName = prompt('Name this recording session:', `Recording_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}`);
+  if(!recordingName) return; // Cancel save
+
+  const recordingData = {
+    name: recordingName,
+    pulsePeaks: [...pulsePeaks],
+    throbs: [...throbs],
+    pttCompensation,
+    durationMs: performance.now() - startTime - elapsedPauseTime,
+    bpmHistory: [...bpmHistory]
+  };
+  recordings.push(recordingData);
+  addRecordingToList(recordingData);
+  enableButtonsDuringRecording(false);
+  clearCanvas();
+  updateTimerDisplay(0);
+  waveformData.fill(0);
+  timeBuffer.fill(0);
+}
+
+// Mark a migraine throb
+function markThrob() {
+  if(!recording || paused) return;
+  const now = performance.now() - startTime - elapsedPauseTime;
+  // Find index of prior pulse peak
+  let priorPeakIndex = -1;
+  for(let i = pulsePeaks.length - 1; i >= 0; i--) {
+    if(pulsePeaks[i].time <= now) {
+      priorPeakIndex = i;
+      break;
+    }
+  }
+  throbs.push({time: now, priorPeakIndex});
+}
+
+// Timer update
+function updateTimer() {
+  if(!recording || paused) return;
+  const now = performance.now();
+  const elapsed = now - startTime - elapsedPauseTime;
+  updateTimerDisplay(elapsed);
+}
+
+// Update timer display text
+function updateTimerDisplay(ms) {
+  timerDisplay.textContent = formatTime(ms);
+}
+
+// Enable/disable buttons based on recording state
+function enableButtonsDuringRecording(isRecording, isPaused = false) {
+  startBtn.disabled = isRecording;
+  pauseBtn.disabled = !isRecording || isPaused;
+  resumeBtn.disabled = !isRecording || !isPaused;
+  stopBtn.disabled = !isRecording;
+  markThrobBtn.disabled = !isRecording || isPaused;
+  exportCSVBtn.disabled = recordings.length === 0;
+}
+
+// ECG simulation function - Gaussian pulses for PQRST
+function simulateECGSample(t) {
+  // ECG approx: P(0.1), Q(-0.15), R(1), S(-0.25), T(0.35) as Gaussian pulses
+  
+  // time normalized within one beat cycle [0,ecgPeriod)
+  let cycleTime = t % ecgPeriod;
+
+  function gauss(x, mean, sd, amplitude) {
+    return amplitude * Math.exp(-((x - mean) ** 2) / (2 * sd * sd));
+  }
+
+  let p = gauss(cycleTime, 100, 15, 0.1);
+  let q = gauss(cycleTime, 200, 7, -0.15);
+  let r = gauss(cycleTime, 250, 5, 1.0);
+  let s = gauss(cycleTime, 280, 5, -0.25);
+  let tWave = gauss(cycleTime, 400, 30, 0.35);
+
+  return p + q + r + s + tWave;
+}
+
+// Detect R peak using sliding window and phase logic (simplified)
+// Here we use max within last 50 ms (~12 samples at 250Hz)
+function detectPeak(index) {
+  const windowSize = Math.floor(sampleRate * 0.05); // 50ms
+  if(index < windowSize) return false;
+  let val = waveformData[index];
+  for(let i = index - windowSize; i < index; i++) {
+    if(waveformData[i] > val) return false;
+  }
+  return true;
+}
+
+// Update BPM array based on last two peaks
+function updateBPM(currentTime) {
+  if(pulsePeaks.length < 2) return;
+  const lastPeak = pulsePeaks[pulsePeaks.length - 1];
+  const prevPeak = pulsePeaks[pulsePeaks.length - 2];
+  const deltaMs = lastPeak.time - prevPeak.time;
+  if(deltaMs <= 0) return;
+  const bpm = 60000 / deltaMs;
+  bpmHistory.push({time: currentTime, bpm});
+}
+
+// Main animation / simulation loop
+function runSimulation() {
+  if(!recording || paused) return;
+
+  const now = performance.now();
+  const elapsed = now - startTime - elapsedPauseTime;
+  simulationTime = elapsed;
+
+  // Generate new ECG sample for current time
+  const sample = simulateECGSample(simulationTime);
+
+  // Shift waveform data buffer to left by one sample
+  waveformData.shift();
+  waveformData.push(sample);
+  timeBuffer.shift();
+  timeBuffer.push(simulationTime);
+
+  // Detect peak at current end of buffer (simplified)
+  const lastIndex = waveformData.length - 1;
+  if(detectPeak(lastIndex)) {
+    // Avoid double detection (min 300 ms apart)
+    if(pulsePeaks.length === 0 || simulationTime - pulsePeaks[pulsePeaks.length - 1].time > 300) {
+      pulsePeaks.push({time: simulationTime});
+      updateBPM(simulationTime);
+    }
+  }
+
+  drawCanvas();
+
+  animationFrameId = requestAnimationFrame(runSimulation);
+}
+
+// Draw canvas waveform and markers
+function drawCanvas() {
+  if(!waveformVisible) {
+    clearCanvas();
+    return;
+  }
+  ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+
+  // Draw waveform
+  ctx.beginPath();
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+
+  for(let i = 0; i < waveformData.length; i++) {
+    const x = (i / dataBufferSize) * canvasWidth;
+    // Normalize sample amplitude approx between -0.5 and 1.2 to canvas height
+    const norm = (waveformData[i] + 0.5) / 1.7;
+    const y = canvasHeight - norm * canvasHeight;
+    if(i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Draw pulse peaks (red)
+  ctx.fillStyle = 'red';
+  pulsePeaks.forEach(p => {
+    // find position on canvas (time normalized within last 5s window)
+    const relTime = simulationTime - p.time;
+    if(relTime > displaySeconds * 1000 || relTime < 0) return;
+    const x = canvasWidth * (1 - relTime / (displaySeconds * 1000));
+    const y = canvasHeight * 0.9;
+    ctx.beginPath();
+    ctx.arc(x, y, 5, 0, 2 * Math.PI);
+    ctx.fill();
+  });
+
+  // Draw throbs (green)
+  ctx.fillStyle = 'green';
+  throbs.forEach(t => {
+    const relTime = simulationTime - t.time;
+    if(relTime > displaySeconds * 1000 || relTime < 0) return;
+    const x = canvasWidth * (1 - relTime / (displaySeconds * 1000));
+    const y = canvasHeight * 0.1;
+    ctx.beginPath();
+    ctx.arc(x, y, 6, 0, 2 * Math.PI);
+    ctx.fill();
+  });
+}
+
+// Clear canvas fully
+function clearCanvas() {
+  ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+}
+
+// Add recording to list UI
+function addRecordingToList(rec) {
+  const li = document.createElement('li');
+  li.textContent = `${rec.name} - Duration: ${(rec.durationMs/1000).toFixed(1)}s, Throbs: ${rec.throbs.length}, Pulses: ${rec.pulsePeaks.length}`;
+  recordingsUl.appendChild(li);
+  exportCSVBtn.disabled = false;
+}
+
+// Export CSV logic
+function exportCSV() {
+  if(recordings.length === 0) return;
+  // Export last recording
+  const rec = recordings[recordings.length -1];
+
+  // Calculate stats
+  const phases = [];
+  const deltas = [];
+  const bpmVals = [];
+
+  for(let i = 0; i < rec.throbs.length; i++) {
+    const throb = rec.throbs[i];
+    if(throb.priorPeakIndex < 0 || throb.priorPeakIndex >= rec.pulsePeaks.length -1) continue;
+    const priorR = rec.pulsePeaks[throb.priorPeakIndex];
+    const nextR = rec.pulsePeaks[throb.priorPeakIndex + 1];
+
+    const delta = throb.time - priorR.time + rec.pttCompensation;
+    const interval = nextR.time - priorR.time;
+    if(interval <= 0) continue;
+
+    const phase = ((delta % interval) + interval) % interval / interval * 2 * Math.PI;
+    phases.push(phase);
+    deltas.push(delta);
+    bpmVals.push(rec.bpmHistory.length > 0 ? rec.bpmHistory[rec.bpmHistory.length -1].bpm : 60);
+  }
+
+  // Circular stats calculations:
+  // Rayleigh R and mean vector angle
+  let sumSin = 0;
+  let sumCos = 0;
+  for(let p of phases) {
+    sumSin += Math.sin(p);
+    sumCos += Math.cos(p);
+  }
+  const n = phases.length;
+  const meanAngle = Math.atan2(sumSin/n, sumCos/n);
+  const R = Math.sqrt((sumCos/n)**2 + (sumSin/n)**2);
+
+  // Rayleigh p-value approximation
+  const rayleighP = Math.exp(Math.sqrt(1+4*n+4*(n**2 - (n*R)**2)) - (1+2*n));
+
+  // Standard deviation of deltas
+  const meanDelta = deltas.reduce((a,b)=>a+b,0)/deltas.length || 0;
+  const stdDelta = Math.sqrt(deltas.reduce((a,b)=>a+(b-meanDelta)**2,0)/deltas.length) || 0;
+
+  // Prepare CSV content
+  let csvContent = '';
+  csvContent += `Recording Name,${rec.name}\n`;
+  csvContent += `Total Throb Count,${rec.throbs.length}\n`;
+  csvContent += `Total Pulse Peak Count,${rec.pulsePeaks.length}\n`;
+  csvContent += `Mean Pulse Rate (BPM),${(bpmVals.reduce((a,b)=>a+b,0)/bpmVals.length || 0).toFixed(2)}\n`;
+  csvContent += `Rayleigh R,${R.toFixed(4)}\n`;
+  csvContent += `Rayleigh p-value,${rayleighP < 0.001 ? '<0.001' : rayleighP.toFixed(3)}\n`;
+  csvContent += `Phase Vector Length (PVL),${R.toFixed(4)}\n`;
+  csvContent += `Standard Deviation of Delta (ms),${stdDelta.toFixed(2)}\n`;
+  csvContent += `Mean Vector Angle (radians),${meanAngle.toFixed(4)}\n\n`;
+
+  csvContent += `Throb Time (ms),Prior R Peak Time (ms),Delta (ms),BPM at Prior R,Phase (radians)\n`;
+  for(let i = 0; i < rec.throbs.length; i++) {
+    const throb = rec.throbs[i];
+    if(throb.priorPeakIndex < 0 || throb.priorPeakIndex >= rec.pulsePeaks.length -1) continue;
+    const priorR = rec.pulsePeaks[throb.priorPeakIndex];
+    const nextR = rec.pulsePeaks[throb.priorPeakIndex + 1];
+    const delta = throb.time - priorR.time + rec.pttCompensation;
+    const interval = nextR.time - priorR.time;
+    if(interval <= 0) continue;
+    const phase = ((delta % interval) + interval) % interval / interval * 2 * Math.PI;
+    const bpm = rec.bpmHistory.length > 0 ? rec.bpmHistory[rec.bpmHistory.length -1].bpm : 60;
+    csvContent += `${throb.time.toFixed(2)},${priorR.time.toFixed(2)},${delta.toFixed(2)},${bpm.toFixed(2)},${phase.toFixed(4)}\n`;
+  }
+
+  csvContent += `\nPulse Peak Timestamps (ms)\n`;
+  for(let p of rec.pulsePeaks) {
+    csvContent += `${p.time.toFixed(2)}\n`;
+  }
+
+  // Download CSV
+  const blob = new Blob([csvContent], {type: 'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${rec.name.replace(/\s+/g,'_')}_migraine_throb_sync.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// Toggle waveform display
+function toggleWaveform() {
+  waveformVisible = !waveformVisible;
+  toggleWaveformBtn.textContent = waveformVisible ? 'Hide Waveform' : 'Show Waveform';
+  drawCanvas();
+}
+
+// PTT slider change handler
+pttRange.addEventListener('input', e => {
+  pttCompensation = Number(e.target.value);
+  pttValueSpan.textContent = pttCompensation;
+});
+
+// Button listeners
+startBtn.addEventListener('click', startRecording);
+pauseBtn.addEventListener('click', pauseRecording);
+resumeBtn.addEventListener('click', resumeRecording);
+stopBtn.addEventListener('click', stopRecording);
+markThrobBtn.addEventListener('click', markThrob);
+toggleWaveformBtn.addEventListener('click', toggleWaveform);
+exportCSVBtn.addEventListener('click', exportCSV);
+
+// Bluetooth connection handler
+connectBluetoothBtn.addEventListener('click', async () => {
+  if(!navigator.bluetooth) {
+    alert('Web Bluetooth API not supported in this browser.');
+    return;
+  }
+
+  try {
+    bluetoothDevice = await navigator.bluetooth.requestDevice({
+      filters: [{namePrefix: 'Frontier'}], // adjust to your device's advertised name prefix
+      optionalServices: ['heart_rate']
+    });
+
+    bluetoothDevice.addEventListener('gattserverdisconnected', () => {
+      alert('Bluetooth device disconnected');
+      bluetoothDevice = null;
+      bluetoothCharacteristic = null;
+    });
+
+    const server = await bluetoothDevice.gatt.connect();
+
+    const service = await server.getPrimaryService('heart_rate');
+    bluetoothCharacteristic = await service.getCharacteristic('heart_rate_measurement');
+
+    await bluetoothCharacteristic.startNotifications();
+
+    bluetoothCharacteristic.addEventListener('characteristicvaluechanged', handleBluetoothData);
+
+    alert(`Connected to ${bluetoothDevice.name}`);
+
+  } catch (error) {
+    alert('Bluetooth connection failed: ' + error);
+  }
+});
+
+// Handle incoming Bluetooth data (basic placeholder)
+function handleBluetoothData(event) {
+  if(!recording || paused) return;
+
+  const value = event.target.value;
+  // According to BLE Heart Rate spec, HR value starts at byte 1 or 2, simplified here:
+  let heartRate = 0;
+  const flags = value.getUint8(0);
+  const hrFormat = flags & 0x01;
+  if(hrFormat === 0) {
+    heartRate = value.getUint8(1);
+  } else {
+    heartRate = value.getUint16(1, /*littleEndian=*/true);
+  }
+
+  const now = performance.now() - startTime - elapsedPauseTime;
+
+  // We'll simulate pulse peak arrival each time we get a HR notification
+  pulsePeaks.push({time: now});
+  updateBPM(now);
+  drawCanvas();
+}
+</script>
+</body>
+</html>
